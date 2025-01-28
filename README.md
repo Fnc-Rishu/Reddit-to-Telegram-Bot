@@ -23,6 +23,7 @@ Script for a telegram bot that fetches media from a list of subreddits and sends
 2. install the requirements from the requirements.txt 
 3. Configure the Config.ini file with your channel id,bot api and subreddits.
 4. Set the Script to run at specified intervals on your local device or cloud.
+5. To Run " python main.py "
 --- 
 #####  Notes
 Cache Folder stores the ids of already fetched post inorder to avoid reposts. 
