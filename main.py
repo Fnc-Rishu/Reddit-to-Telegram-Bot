@@ -14,7 +14,7 @@ config.read("config.ini")
 chat_id = config["Telegram"]["chat_id"]
 #----------------------------------------------------
 is_single_run = eval(config["Main"]["is_single_run"])
-interval = int(config["Main"]["interval"])  # delay after each posting in minutes
+interval = int(config["Main"]["interval"])  # delay after each posting in seconds
 total_messages = int(config["Main"]["total_messages"])  # Total messages to send before script exits.
 
 desired_flairs = [flair.strip() for flair in config["Main"]["desired_flairs"].split(",")]
@@ -119,7 +119,7 @@ def main():
 
         post_status = reddit_int()
         if post_status == 429:  # If too many requests wait a while.
-            delay = .2
+            delay = int(.2 * 60)  # Convert to seconds
 
         elif post_status == 404:  # Failed to fetch post or send message. Instantly get a new post.
             Cache.save_post_id(reddit.currrent_subreddit, reddit.post_id)
@@ -136,7 +136,7 @@ def main():
             else:
                 rep += 1
 
-        time.sleep(int(delay * 60))
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
