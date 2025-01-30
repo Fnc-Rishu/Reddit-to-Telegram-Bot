@@ -14,13 +14,9 @@ config.read("config.ini")
 chat_id = config["Telegram"]["chat_id"]
 #----------------------------------------------------
 is_single_run = eval(config["Main"]["is_single_run"])
-interval = int(config["Main"]["interval"])  # delay after each posting in seconds
-total_messages = int(config["Main"]["total_messages"])  # Total messages to send before script exits.
+instant_send = eval(config["Main"]["instant_send"])
 
 desired_flairs = [flair.strip() for flair in config["Main"]["desired_flairs"].split(",")]
-
-running = True
-rep = 0
 
 tg = TelegramHandler(chat_id=chat_id)
 reddit = RedditHandler()
@@ -112,31 +108,27 @@ def reddit_int():
 
 def main():
     "main function"
-    rep = 0
 
-    while rep < total_messages:  # If configured to run in a loop. exit after a total of 10 messages
-        delay = interval
-
+    while True:  # Continuously run until manually stopped or a single run is configured
         post_status = reddit_int()
         if post_status == 429:  # If too many requests wait a while.
-            delay = int(.2 * 60)  # Convert to seconds
+            print("Too many requests. Sleeping for 2 minutes.")
+            time.sleep(120)  # Wait for 2 minutes before retrying
 
         elif post_status == 404:  # Failed to fetch post or send message. Instantly get a new post.
             Cache.save_post_id(reddit.currrent_subreddit, reddit.post_id)
-            delay = 0
 
         elif post_status == 204:  # No new Content Available.
-            print("no new content")
+            print("No new content")
             if is_single_run:
                 break
         else:
             print("Message Sent.")
             if is_single_run:
                 break
-            else:
-                rep += 1
 
-        time.sleep(delay)
+        if not instant_send:
+            time.sleep(1)  # Short sleep to avoid too frequent requests
 
 
 if __name__ == "__main__":
