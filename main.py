@@ -1,6 +1,5 @@
 import json
 import time
-import re
 from configparser import ConfigParser
 
 from telegram_handler import TelegramHandler
@@ -15,28 +14,26 @@ config.read("config.ini")
 chat_id = config["Telegram"]["chat_id"]
 #----------------------------------------------------
 is_single_run = eval(config["Main"]["is_single_run"])
-instant_send = eval(config["Main"]["instant_send"])
+interval = int(config["Main"]["interval"])  # delay after each posting in seconds
+total_messages = int(config["Main"]["total_messages"])  # Total messages to send before script exits.
 
-# Compile regex patterns for desired flairs
-desired_flairs = [re.compile(flair.strip(), re.IGNORECASE) for flair in config["Main"]["desired_flairs"].split(",")]
+desired_flairs = [flair.strip() for flair in config["Main"]["desired_flairs"].split(",")]
+
+running = True
+rep = 0
 
 tg = TelegramHandler(chat_id=chat_id)
 reddit = RedditHandler()
 cache = Cache()
 
-# Track the latest post ID to avoid redundant checks
-latest_post_id = None
-
 # -----------------------------------------------------
 def reddit_int():
     """
-    Function that uses the 'RedditHandler' to fetch post and converts the fetched post into a telegram message and post using TelegramHandler.
+    Function that uses the 'RedditHandler' to Fetch post and converts the fetched post into a telegram message and post using TelegramHandler.
 
     Returns:
         int: HTTP status code. (204 if no new content is available to fetch)
     """
-    global latest_post_id
-
     reddit_post = reddit.get_reddit_json()  # Fetching the reddit post
     print(f"Fetched post: {reddit_post}")  # Debugging information
 
@@ -49,26 +46,12 @@ def reddit_int():
             post_url = reddit_post[1]
             post_title = reddit_post[2]
             post_flair = reddit_post[3].strip() if len(reddit_post) > 3 else ""  # Extract flair and strip whitespace
-            post_id = reddit.post_id  # Get the post ID
 
-            # Check if the post is the same as the latest post
-            if post_id == latest_post_id:
-                return 204  # No new post, skip further processing
-
-            # Update the latest post ID
-            latest_post_id = post_id
-
-            # Check if post flair matches any of the desired flair patterns
-            if not any(flair.match(post_flair) for flair in desired_flairs):
+            if post_flair not in desired_flairs:
                 print(f"Post skipped due to flair '{post_flair}' not in desired flairs.")
                 return 204  # Skip the post if it doesn't have the desired flair
 
-            # Check if post is already cached
-            if Cache.is_a_repost(reddit.currrent_subreddit, post_id):
-                print(f"Post '{post_title}' already cached. Skipping.")
-                return 204  # Skip if post is already cached
-
-            Cache.save_post_id(reddit.currrent_subreddit, post_id)
+            Cache.save_post_id(reddit.currrent_subreddit, reddit.post_id)
 
             if post_type == "photo":
                 photo_status = tg.send_photo(post_url, post_title)
@@ -129,25 +112,31 @@ def reddit_int():
 
 def main():
     "main function"
+    rep = 0
 
-    while True:  # Continuously run until manually stopped or a single run is configured
+    while rep < total_messages:  # If configured to run in a loop. exit after a total of 10 messages
+        delay = interval
+
         post_status = reddit_int()
         if post_status == 429:  # If too many requests wait a while.
-            print("Too many requests. Sleeping for 2 minutes.")
-            time.sleep(120)  # Wait for 2 minutes before retrying
+            delay = int(.2 * 60)  # Convert to seconds
 
         elif post_status == 404:  # Failed to fetch post or send message. Instantly get a new post.
             Cache.save_post_id(reddit.currrent_subreddit, reddit.post_id)
+            delay = 0
 
         elif post_status == 204:  # No new Content Available.
-            pass  # No new content, wait for next post
+            print("no new content")
+            if is_single_run:
+                break
         else:
             print("Message Sent.")
             if is_single_run:
                 break
+            else:
+                rep += 1
 
-        if not instant_send:
-            time.sleep(1)  # Short sleep to avoid too frequent requests
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
