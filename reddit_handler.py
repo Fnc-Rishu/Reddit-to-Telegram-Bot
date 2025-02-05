@@ -1,6 +1,7 @@
 # reddit_handler.py
 
 from configparser import ConfigParser
+import praw
 import requests
 import random
 from cache import Cache
@@ -17,7 +18,7 @@ HEADER = {
 config = ConfigParser()
 config.read("config.ini")
 
-SUBREDDIT_LIST = config["Reddit"]["subreddits"].split(",")
+SUBREDDIT_LIST = [s.strip() for s in config["Reddit"]["subreddits"].split(",")]
 SEARCH_LIMIT = config["Reddit"]["search_limit"]
 SORT = config["Reddit"]["sort_posts"]
 FETCH_LATEST = eval(config["Reddit"]["fetch_latest_post"])
@@ -37,11 +38,208 @@ REDDIT_PARAMETER = {"limit": SEARCH_LIMIT}
 
 class RedditHandler:
     """
-    Class that handles extracting and filtering of media from fetched json file.
+    Class that handles extracting and filtering of media from Reddit submissions.
     """
     def __init__(self):
         self.retries = 0
         self.current_index = 0
+        self.post_json = None
+        self.gallery_url_list = None
+        
+        # Initialize PRAW for streaming
+        self.reddit = praw.Reddit(
+            client_id=config["Reddit"]["client_id"],
+            client_secret=config["Reddit"]["client_secret"],
+            user_agent="script:RedditToTelegramBot:v1.0 (by /u/YourUsername)"
+        )
+
+    def get_submission_stream(self):
+        """
+        Get a stream of new submissions from all configured subreddits
+        """
+        subreddits = "+".join(SUBREDDIT_LIST)
+        return self.reddit.subreddit(subreddits).stream.submissions(skip_existing=True)
+
+    def process_submission(self, submission):
+        """
+        Process a submission from the stream
+        """
+        try:
+            # Skip removed or stickied posts
+            if hasattr(submission, 'removed_by_category') and submission.removed_by_category:
+                return None
+            if submission.stickied:
+                return None
+
+            # Set current subreddit and post ID
+            self.currrent_subreddit = submission.subreddit.display_name
+            self.post_id = submission.id
+
+            # Check for reposts
+            if Cache.is_a_repost(self.currrent_subreddit, self.post_id):
+                return None
+
+            # Create post_json from submission for compatibility with existing methods
+            self.post_json = {
+                "id": submission.id,
+                "removed_by_category": getattr(submission, 'removed_by_category', None),
+                "stickied": submission.stickied,
+                "permalink": submission.permalink,
+                "title": submission.title,
+                "subreddit": submission.subreddit.display_name,
+                "link_flair_text": submission.link_flair_text,
+                "url_overridden_by_dest": submission.url,
+                "is_gallery": hasattr(submission, 'gallery_data'),
+                "is_video": submission.is_video,
+                "media": submission.media,
+                "post_hint": getattr(submission, 'post_hint', None),
+                "preview": getattr(submission, 'preview', {})
+            }
+
+            if hasattr(submission, 'media_metadata'):
+                self.post_json["media_metadata"] = submission.media_metadata
+
+            # Format post title
+            post_title = ""
+            current_reddit_url = f'www.reddit.com{submission.permalink}'
+
+            if INCLUDE_TITLE:
+                post_title += submission.title + "\n"
+            if LINK_TO_POST:
+                post_title += f'<a href="{current_reddit_url}">r/{submission.subreddit.display_name}</a>\n\n'
+            if SIGN_MESSAGES:
+                post_title += f'<a href="{CHANNEL_LINK}">-{CHANNEL_NAME}</a>'
+
+            # Check post types
+            if not ONLY_IMAGES:
+                if self.is_photo_post():
+                    return ("photo", submission.url, post_title, submission.link_flair_text)
+
+                elif self.is_gallery_post():
+                    gallery_data = self.process_gallery(submission)
+                    if gallery_data:
+                        return ("gallery", gallery_data[0], gallery_data[1], post_title, submission.link_flair_text)
+
+                elif self.is_animation_post():
+                    return ("animation", submission.url, post_title, submission.link_flair_text)
+
+                elif self.is_video_post():
+                    if submission.media and 'reddit_video' in submission.media:
+                        video_url = submission.media['reddit_video']['fallback_url']
+                        video_id = video_url.rsplit("/", 1)[1]
+                        video_height = submission.media['reddit_video']['height']
+                        return ("video", video_id, video_height, post_title, submission.link_flair_text)
+
+                elif self.is_gfycat_post():
+                    if submission.media and 'oembed' in submission.media:
+                        preview_url = submission.media['oembed']['thumbnail_url']
+                        gfycat_id = preview_url.split("/")[-1].split("-")[-2]
+                        return ("gfycat", gfycat_id, post_title, submission.link_flair_text)
+
+            else:  # Photo posts only
+                if self.is_photo_post():
+                    return ("photo", submission.url, post_title, submission.link_flair_text)
+
+            return None
+
+        except Exception as e:
+            print(f"Error processing submission: {e}")
+            return None
+
+    def process_gallery(self, submission):
+        """Process gallery submissions"""
+        try:
+            if not hasattr(submission, 'gallery_data') or not hasattr(submission, 'media_metadata'):
+                return None
+
+            gallery_photo_list = []
+            animation_list = []
+            first_run = True
+
+            for item in submission.media_metadata.values():
+                if item["status"] == "valid":
+                    if item["e"] == "Image":
+                        url = item["s"]["u"].replace("amp;", "")
+                        media_obj = InputObject(
+                            media=url,
+                            type="photo",
+                            caption=submission.title if first_run else "",
+                            subreddit=submission.subreddit.display_name,
+                            reddit_url=f'www.reddit.com{submission.permalink}'
+                        )
+                        gallery_photo_list.append(media_obj.__dict__)
+                        first_run = False
+                    elif item["e"] == "AnimatedImage":
+                        url = item["s"]["gif"]
+                        animation_list.append(url)
+
+            return (gallery_photo_list, animation_list)
+
+        except Exception as e:
+            print(f"Error processing gallery: {e}")
+            return None
+
+    def is_photo_post(self):
+        """
+        Checks if the extracted post json block represents a photo post.
+
+        Returns:
+            bool:
+        """
+        try:
+            override_url = self.post_json["url_overridden_by_dest"]
+            return any(override_url.lower().endswith(ext) for ext in PHOTO_FILE_TYPES)
+        except:
+            return False
+
+    def is_gallery_post(self):
+        """
+        Checks if the extracted json block represents a gallery post.
+
+        Returns:
+            bool:
+        """
+        try:
+            return self.post_json["is_gallery"] and self.post_json["media_metadata"] is not None
+        except:
+            return False
+
+    def is_animation_post(self):
+        """
+        Checks if the extracted post json block represents an animation(gif) post.
+
+        Returns:
+            bool:
+        """
+        try:
+            override_url = self.post_json["url_overridden_by_dest"]
+            return any(override_url.lower().endswith(ext) for ext in ANIMATION_FILE_TYPES)
+        except:
+            return False
+
+    def is_video_post(self):
+        """
+        Checks if the extracted json block represents an internal video post.
+
+        Returns:
+            bool:
+        """
+        try:
+            return self.post_json["post_hint"] == "hosted:video" and self.post_json["is_video"]
+        except:
+            return False
+
+    def is_gfycat_post(self):
+        """
+        Checks if the extracted json block represents an embedded gyfcat post.
+
+        Returns:
+            bool:
+        """
+        try:
+            return self.post_json["post_hint"] == "rich:video" and self.post_json["media"]["type"] == "gfycat.com"
+        except:
+            return False
 
     def get_reddit_json(self, retry: bool = False):
         """
@@ -97,7 +295,6 @@ class RedditHandler:
         Returns:
             bool|tuple: A tuple containing the post type, media url or media object, caption, and flair. False on fail
         """
-
         if FETCH_LATEST:  # Only look for the most recent post in the specified time.
             if not retry:
                 self.index = 0
@@ -234,120 +431,3 @@ class RedditHandler:
                     return ("photo", current_url, post_title, post_flair)
                 else:
                     return False
-
-    def is_photo_post(self):
-        """
-        Checks if the extracted post json block represents a photo post.
-
-        Returns:
-            bool:
-        """
-        try:
-            override_url = self.post_json["url_overridden_by_dest"]
-        except KeyError:
-            return False
-        else:
-            try:
-                url_ext = (override_url.rsplit(".", 1)[1])
-                if url_ext in PHOTO_FILE_TYPES:
-                    return True
-            except:
-                return False
-        return False
-
-    def is_gallery_post(self):
-        """
-        Checks if the extracted json block represents a gallery post.
-
-        Returns:
-            bool:
-
-        """
-        self.gallery_url_list = []  # change self later
-        iteration = 0
-        media_data = {"photo": [], "animation": []}
-
-        try:
-            if self.post_json["is_gallery"]:
-                pass
-        except KeyError:
-            return False
-        else:
-            if self.post_json["is_gallery"]:
-                if self.post_json["media_metadata"] is not None:
-                    for item in self.post_json["media_metadata"]:
-                        if self.post_json["media_metadata"][item]["status"] == "valid" and iteration <= 8:
-                            post_type = self.post_json["media_metadata"][item]["e"]
-                            if post_type == "Image":
-                                raw_url = self.post_json["media_metadata"][item]["s"]["u"]
-                                url = raw_url.replace("amp;", "")
-                                media_data["photo"].append(url)
-                            elif post_type == "AnimatedImage":
-                                url = self.post_json["media_metadata"][item]["s"]["gif"]
-                                media_data["animation"].append(url)
-                            iteration += 1
-                    self.gallery_url_list = media_data
-                    return True
-                else:
-                    pass
-            else:
-                Cache.save_post_id(self.currrent_subreddit, self.post_id)
-                return False
-
-    def is_animation_post(self):
-        """
-        Checks if the extracted json block represents an animation(gif) post.
-
-        Returns:
-            bool:
-
-        """
-        try:
-            override_url = self.post_json["url_overridden_by_dest"]
-        except KeyError:
-            return False
-        else:
-            try:
-                url_ext = (override_url.rsplit(".", 1)[1])
-            except:
-                return False
-            else:
-                if url_ext in ANIMATION_FILE_TYPES:
-                    return True
-        return False
-
-    def is_video_post(self):
-        """
-        Checks if the extracted json block represents an internal video post.
-
-        Returns:
-             bool:
-
-        """
-        try:
-            post_hint = self.post_json["post_hint"]
-            is_video = self.post_json["is_video"]
-        except KeyError:
-            return False
-        else:
-            if post_hint == "hosted:video" and is_video:
-                return True
-        return False
-
-    def is_gfycat_post(self):
-        """
-        Checks if the extracted json block represents an embedded gyfcat post.
-
-        Returns:
-            bool:
-
-        """
-        try:
-            post_hint = self.post_json["post_hint"]
-        except KeyError:
-            return False
-        else:
-            if post_hint == "rich:video":
-                if self.post_json["media"]["type"] == "gfycat.com":
-                    return True
-            return False
