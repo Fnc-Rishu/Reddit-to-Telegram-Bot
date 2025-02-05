@@ -1,62 +1,69 @@
 import json
 import time
+import re
 from configparser import ConfigParser
-
 from telegram_handler import TelegramHandler
 from reddit_handler import RedditHandler
 from cache import Cache
 
 # ------Loading Data from the Config File----------
-
-config = ConfigParser()  # Loading the config file
+config = ConfigParser()
 config.read("config.ini")
 
 chat_id = config["Telegram"]["chat_id"]
-#----------------------------------------------------
-is_single_run = eval(config["Main"]["is_single_run"])
-interval = int(config["Main"]["interval"])  # delay after each posting in seconds
-total_messages = int(config["Main"]["total_messages"])  # Total messages to send before script exits.
-
-desired_flairs = [flair.strip() for flair in config["Main"]["desired_flairs"].split(",")]
-
-running = True
-rep = 0
+# Convert desired flairs to regex patterns
+desired_flairs = [re.compile(rf"^{re.escape(flair.strip())}$", re.IGNORECASE) 
+                 for flair in config["Main"]["desired_flairs"].split(",")]
 
 tg = TelegramHandler(chat_id=chat_id)
 reddit = RedditHandler()
 cache = Cache()
 
-# -----------------------------------------------------
-def reddit_int():
+def matches_desired_flair(post_flair):
     """
-    Function that uses the 'RedditHandler' to Fetch post and converts the fetched post into a telegram message and post using TelegramHandler.
-
-    Returns:
-        int: HTTP status code. (204 if no new content is available to fetch)
+    Check if the post flair matches any of the desired flairs using regex
     """
-    reddit_post = reddit.get_reddit_json()  # Fetching the reddit post
-    print(f"Fetched post: {reddit_post}")  # Debugging information
+    if not post_flair:
+        return False
+    
+    return any(pattern.match(post_flair.strip()) for pattern in desired_flairs)
 
-    if reddit_post:
-        if isinstance(reddit_post, int):  # if an error code is returned.
-            return reddit_post
+def process_submission(submission):
+    """
+    Process a single Reddit submission
+    """
+    try:
+        # Skip if post is already in cache
+        if Cache.is_a_repost(submission.subreddit.display_name, submission.id):
+            return None
 
-        elif isinstance(reddit_post, tuple):  # tuple means a post has been fetched.
+        # Get post flair
+        post_flair = submission.link_flair_text.strip() if submission.link_flair_text else ""
+        
+        # Skip if flair doesn't match desired flairs
+        if not matches_desired_flair(post_flair):
+            print(f"Post skipped due to flair '{post_flair}' not matching any desired flairs.")
+            return None
+
+        # Convert submission to post data
+        reddit_post = reddit.process_submission(submission)
+        
+        if not reddit_post:
+            return None
+
+        if isinstance(reddit_post, tuple):
             post_type = reddit_post[0]
             post_url = reddit_post[1]
             post_title = reddit_post[2]
-            post_flair = reddit_post[3].strip() if len(reddit_post) > 3 else ""  # Extract flair and strip whitespace
 
-            if post_flair not in desired_flairs:
-                print(f"Post skipped due to flair '{post_flair}' not in desired flairs.")
-                return 204  # Skip the post if it doesn't have the desired flair
+            # Save to cache before processing
+            Cache.save_post_id(submission.subreddit.display_name, submission.id)
 
-            Cache.save_post_id(reddit.currrent_subreddit, reddit.post_id)
-
+            # Process different post types
             if post_type == "photo":
                 photo_status = tg.send_photo(post_url, post_title)
                 if not photo_status:
-                    return 404
+                    return None
 
             elif post_type == "gallery":
                 gallery_photo_posts = reddit_post[1]
@@ -69,7 +76,7 @@ def reddit_int():
 
                 if gallery_photo_post_len == 0:  # If gallery has only GIFs
                     for animation_url in gallery_animation_posts:
-                        if gallery_animation_posts.index(animation_url) == gallery_animation_post_len - 1:  # for only the last Gif to have caption.
+                        if gallery_animation_posts.index(animation_url) == gallery_animation_post_len - 1:
                             gallery_status = tg.send_animation(animation_url=animation_url, title=post_title)
                         else:
                             gallery_status = tg.send_animation(animation_url=animation_url, title="")
@@ -77,67 +84,55 @@ def reddit_int():
                 elif gallery_animation_post_len == 0:
                     gallery_status = tg.send_media_group(gallery_json_obj)
 
-                else:  # Gallery has both Gif and photo, so Gifs first, followed by photos(with caption)
+                else:  # Gallery has both GIFs and photos
                     for animation_url in gallery_animation_posts:
                         gallery_status = tg.send_animation(animation_url)
                     gallery_status = tg.send_media_group(gallery_json_obj)
 
-                if not gallery_status:
-                    return 404
-
             elif post_type == "animation":
                 animation_status = tg.send_animation(animation_url=post_url, title=post_title)
                 if not animation_status:
-                    return 404
+                    return None
 
             elif post_type == "video":
                 video_id = reddit_post[1]
                 video_resolution = reddit_post[2]
                 video_status = tg.send_video(video_id=video_id, video_resolution=video_resolution, title=post_title)
                 if not video_status:
-                    return 404
+                    return None
 
             elif post_type == "gfycat":
                 gfycat_status = tg.send_gfycat(post_url, post_title)
                 if not gfycat_status:
-                    return 404
+                    return None
 
-            else:
-                return 404
+    except Exception as e:
+        print(f"Error processing submission: {e}")
+        return None
 
-    else:  # just in case
-        Cache.save_post_id(reddit.currrent_subreddit, reddit.post_id)
-        return 404
-
+def stream_subreddits():
+    """
+    Stream new posts from configured subreddits
+    """
+    subreddits = [s.strip() for s in config["Reddit"]["subreddits"].split(",")]
+    multi_subreddit = "+".join(subreddits)
+    
+    print(f"Starting to stream posts from: {multi_subreddit}")
+    print(f"Watching for posts with these flairs: {[pattern.pattern[1:-1] for pattern in desired_flairs]}")
+    
+    while True:
+        try:
+            # Get the subreddit stream
+            for submission in reddit.get_submission_stream():
+                process_submission(submission)
+        except Exception as e:
+            print(f"Stream interrupted: {e}")
+            print("Restarting stream in 30 seconds...")
+            time.sleep(30)
 
 def main():
-    "main function"
-    rep = 0
-
-    while rep < total_messages:  # If configured to run in a loop. exit after a total of 10 messages
-        delay = interval
-
-        post_status = reddit_int()
-        if post_status == 429:  # If too many requests wait a while.
-            delay = int(.2 * 60)  # Convert to seconds
-
-        elif post_status == 404:  # Failed to fetch post or send message. Instantly get a new post.
-            Cache.save_post_id(reddit.currrent_subreddit, reddit.post_id)
-            delay = 0
-
-        elif post_status == 204:  # No new Content Available.
-            print("no new content")
-            if is_single_run:
-                break
-        else:
-            print("Message Sent.")
-            if is_single_run:
-                break
-            else:
-                rep += 1
-
-        time.sleep(delay)
-
+    """Main function using streaming approach"""
+    stream_subreddits()
 
 if __name__ == "__main__":
     main()
