@@ -1,5 +1,7 @@
 # reddit_handler.py
-
+# At the beginning of the file, add new imports if not already present
+import re
+from typing import Optional, Tuple, List, Dict, Any
 from configparser import ConfigParser
 import praw
 import requests
@@ -386,48 +388,4 @@ class RedditHandler:
                                                                 subreddit=current_subreddit,
                                                                 reddit_url=current_reddit_url)
 
-                        dict_obj = reddit_media_group_object.__dict__  # Object to dictionary
-
-                        if not first_run:  # Delete caption of all other photos and keep only one.
-                            del dict_obj["caption"]
-                        first_run = False
-                        gallery_photo_list.append(dict_obj)  # save dict to list
-
-                    for link in self.gallery_url_list["animation"]:
-                        animation_list.append(link)
-
-                    photo_list = gallery_photo_list  # json this later in the main.py
-                    return ("gallery", photo_list, animation_list, post_title, post_flair)
-
-                # ------------------------Animation Post------------------------------
-                elif self.is_animation_post():
-                    current_type = "animation"
-                    current_url = self.post_json["url_overridden_by_dest"]
-                    return ("animation", current_url, post_title, post_flair)
-
-                # ------------------------Video Post------------------------------
-                elif self.is_video_post():
-                    video_url = self.post_json["url_overridden_by_dest"]
-                    video_id = video_url.rsplit("/", 1)[1]  # Extracting the id from the url v.reddit.it/video_id
-                    video_height = self.post_json["preview"]["images"][0]["source"]["height"]  # height is to be used in the url.
-                    return ("video", video_id, video_height, post_title, post_flair)
-
-                # ------------------------Gfycat Post------------------------------
-                elif self.is_gfycat_post():
-                    preview_url = self.post_json["secure_media"]["oembed"]["thumbnail_url"]
-                    after_slash = preview_url.split("/")[-1]
-                    after_dash = after_slash.split("-")[-2]
-                    gfycat_id = after_dash  # extracting the id
-                    return ("gfycat", gfycat_id, post_title, post_flair)
-
-                # ------------------------Unsupported Post------------------------------
-                else:
-                    return 404
-
-            else:  # Post photo only
-                # ---------------------Photo Post----------------------
-                if self.is_photo_post():
-                    current_url = self.post_json["url_overridden_by_dest"]
-                    return ("photo", current_url, post_title, post_flair)
-                else:
-                    return False
+                        dict_obj = reddit_media
