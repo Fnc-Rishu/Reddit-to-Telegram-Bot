@@ -1,5 +1,3 @@
-# reddit_handler.py
-# At the beginning of the file, add new imports if not already present
 import re
 from typing import Optional, Tuple, List, Dict, Any
 from configparser import ConfigParser
@@ -8,6 +6,7 @@ import requests
 import random
 from cache import Cache
 from input_object import InputObject
+from datetime import datetime, timezone
 
 HEADER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -35,13 +34,7 @@ ONLY_IMAGES = eval(config["Telegram"]["only_images"])
 PHOTO_FILE_TYPES = ["jpg", "jpeg", "png", "webp"]
 ANIMATION_FILE_TYPES = ["gif", "gifv", "mp4"]
 
-REDDIT_URL = "https://www.reddit.com/r/"
-REDDIT_PARAMETER = {"limit": SEARCH_LIMIT}
-
 class RedditHandler:
-    """
-    Class that handles extracting and filtering of media from Reddit submissions.
-    """
     def __init__(self):
         self.retries = 0
         self.current_index = 0
@@ -56,16 +49,25 @@ class RedditHandler:
         )
 
     def get_submission_stream(self):
-        """
-        Get a stream of new submissions from all configured subreddits
-        """
+        """Get a stream of new submissions from all configured subreddits"""
         subreddits = "+".join(SUBREDDIT_LIST)
         return self.reddit.subreddit(subreddits).stream.submissions(skip_existing=True)
 
+    def format_post_metadata(self, submission):
+        """Format post metadata including timestamp and user info"""
+        utc_now = datetime.now(timezone.utc)
+        formatted_time = utc_now.strftime("%Y-%m-%d %H:%M:%S")
+        user_login = submission.author.name if submission.author else "Unknown"
+        
+        metadata = [
+            f"Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {formatted_time}",
+            f"Current User's Login: {user_login}"
+        ]
+        
+        return "\n".join(metadata)
+
     def process_submission(self, submission):
-        """
-        Process a submission from the stream
-        """
+        """Process a submission from the stream"""
         try:
             # Skip removed or stickied posts
             if hasattr(submission, 'removed_by_category') and submission.removed_by_category:
@@ -77,11 +79,7 @@ class RedditHandler:
             self.currrent_subreddit = submission.subreddit.display_name
             self.post_id = submission.id
 
-            # Check for reposts
-            if Cache.is_a_repost(self.currrent_subreddit, self.post_id):
-                return None
-
-            # Create post_json from submission for compatibility with existing methods
+            # Create post_json from submission
             self.post_json = {
                 "id": submission.id,
                 "removed_by_category": getattr(submission, 'removed_by_category', None),
@@ -101,16 +99,18 @@ class RedditHandler:
             if hasattr(submission, 'media_metadata'):
                 self.post_json["media_metadata"] = submission.media_metadata
 
-            # Format post title
+            # Format post title with metadata
             post_title = ""
-            current_reddit_url = f'www.reddit.com{submission.permalink}'
-
             if INCLUDE_TITLE:
                 post_title += submission.title + "\n"
+          
             if LINK_TO_POST:
-                post_title += f'<a href="{current_reddit_url}">r/{submission.subreddit.display_name}</a>\n\n'
+                current_reddit_url = f'www.reddit.com{submission.permalink}'
+                post_title += f'<a href="{current_reddit_url}">r/{submission.subreddit.display_name}</a>\n'
+         
             if SIGN_MESSAGES:
                 post_title += f'<a href="{CHANNEL_LINK}">-{CHANNEL_NAME}</a>'
+
 
             # Check post types
             if not ONLY_IMAGES:
@@ -154,28 +154,43 @@ class RedditHandler:
             if not hasattr(submission, 'gallery_data') or not hasattr(submission, 'media_metadata'):
                 return None
 
-            gallery_photo_list = []
-            animation_list = []
-            first_run = True
+            gallery_photos = []
+            gallery_animations = []
+        
+            # Format caption (only for first image)
+            post_title = ""
+            if INCLUDE_TITLE:
+                post_title += submission.title + "\n"
+            if LINK_TO_POST:
+                post_title += f'<a href="https://www.reddit.com{submission.permalink}">r/{submission.subreddit.display_name}</a>\n'
+            if SIGN_MESSAGES:
+                post_title += f'<a href="{CHANNEL_LINK}">-{CHANNEL_NAME}</a>'
 
-            for item in submission.media_metadata.values():
-                if item["status"] == "valid":
-                    if item["e"] == "Image":
-                        url = item["s"]["u"].replace("amp;", "")
-                        media_obj = InputObject(
-                            media=url,
-                            type="photo",
-                            caption=submission.title if first_run else "",
-                            subreddit=submission.subreddit.display_name,
-                            reddit_url=f'www.reddit.com{submission.permalink}'
-                        )
-                        gallery_photo_list.append(media_obj.__dict__)
-                        first_run = False
-                    elif item["e"] == "AnimatedImage":
-                        url = item["s"]["gif"]
-                        animation_list.append(url)
+            # Process all media items
+            for item in submission.gallery_data['items']:
+                if item['media_id'] in submission.media_metadata:
+                    media = submission.media_metadata[item['media_id']]
+                    if media["status"] == "valid":
+                        if media["e"] == "Image":
+                            url = media["s"]["u"].replace("amp;", "")
+                            # Create media group object for photos
+                            media_obj = InputObject(
+                                media=url,
+                                type="photo",
+                                # Only add caption to first photo in group
+                                caption=post_title if len(gallery_photos) == 0 else "",
+                                subreddit=submission.subreddit.display_name,
+                                reddit_url=f'https://www.reddit.com{submission.permalink}'
+                            )
+                            gallery_photos.append(media_obj.__dict__)
+                        elif media["e"] == "AnimatedImage":
+                            url = media["s"]["gif"]
+                            gallery_animations.append(url)
 
-            return (gallery_photo_list, animation_list)
+            if gallery_photos or gallery_animations:
+                return ("gallery", gallery_photos, gallery_animations, post_title, submission.link_flair_text)
+  
+            return None
 
         except Exception as e:
             print(f"Error processing gallery: {e}")
