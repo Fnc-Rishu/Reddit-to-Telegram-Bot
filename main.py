@@ -66,6 +66,33 @@ def matches_desired_flair(post_flair):
     print(f"Post skipped due to flair '{post_flair}' not matching any desired flairs.")
     return False
 
+def collect_media_items(submission):
+    """Collect all media items from a submission"""
+    media_items = []
+    
+    if hasattr(submission, 'gallery_data') and hasattr(submission, 'media_metadata'):
+        for item in submission.gallery_data['items']:
+            media_id = item['media_id']
+            if media_id in submission.media_metadata:
+                metadata = submission.media_metadata[media_id]
+                if metadata['status'] == 'valid':
+                    if metadata['e'] == 'Image':
+                        url = metadata['s']['u'].replace("amp;", "")
+                        media_items.append(('photo', url))
+                    elif metadata['e'] == 'AnimatedImage':
+                        url = metadata['s']['gif'].replace("amp;", "")
+                        media_items.append(('animation', url))
+    elif submission.url.lower().split('.')[-1] in ['jpg', 'jpeg', 'png', 'webp']:
+        media_items.append(('photo', submission.url))
+    elif submission.url.lower().split('.')[-1] in ['gif', 'gifv', 'mp4']:
+        media_items.append(('animation', submission.url))
+    elif hasattr(submission, 'is_video') and submission.is_video:
+        if submission.media and 'reddit_video' in submission.media:
+            url = submission.media['reddit_video']['fallback_url']
+            media_items.append(('video', url))
+            
+    return media_items
+
 def process_submission(submission):
     """Process a single Reddit submission with support for multiple media"""
     try:
@@ -77,95 +104,69 @@ def process_submission(submission):
         if not matches_desired_flair(post_flair):
             return None
 
-        reddit_post = reddit.process_submission(submission)
-        
-        if not reddit_post:
+        # Collect all media items first
+        media_items = collect_media_items(submission)
+        if not media_items:
             return None
 
-        if isinstance(reddit_post, tuple):
-            post_type = reddit_post[0]
-            
-            Cache.save_post_id(submission.subreddit.display_name, submission.id)
-            
+        Cache.save_post_id(submission.subreddit.display_name, submission.id)
+        
+        user_login = submission.author.name if submission.author else "Unknown"
+        post_title = format_post_title(submission.title, len(media_items), user_login)
+
+        # Format base title with metadata
+        base_title = post_title
+        if config.getboolean("Telegram", "link_to_post", fallback=True):
+            base_title += f'\n<a href="https://www.reddit.com{submission.permalink}">r/{submission.subreddit.display_name}</a>'
+        if config.getboolean("Telegram", "sign_messages", fallback=True):
+            base_title += f'\n<a href="{config["Telegram"]["channel_link"]}">-{config["Telegram"]["channel_name"]}</a>'
+
+        # Send first item with full caption
+        first_item = media_items[0]
+        if first_item[0] == 'photo':
+            if not tg.send_photo(first_item[1], base_title):
+                return False
+        elif first_item[0] == 'animation':
+            if not tg.send_animation(first_item[1], base_title):
+                return False
+        elif first_item[0] == 'video':
+            if not tg.send_video(first_item[1], base_title):
+                return False
+
+        # Send remaining items without caption
+        for media_type, url in media_items[1:]:
             max_retries = 3
             retry_delay = 5
-            user_login = submission.author.name if submission.author else "Unknown"
-
-            if post_type == "gallery":
-                gallery_items = []
-                
-                if hasattr(submission, 'gallery_data') and hasattr(submission, 'media_metadata'):
-                    for item_id in submission.gallery_data['items']:
-                        metadata = submission.media_metadata[item_id['media_id']]
-                        if metadata['status'] == 'valid':
-                            if metadata['e'] == 'Image':
-                                url = metadata['s']['u']
-                                gallery_items.append(('photo', url))
-                            elif metadata['e'] == 'AnimatedImage':
-                                url = metadata['s']['gif']
-                                gallery_items.append(('animation', url))
-
-                if gallery_items:
-                    first_item = gallery_items[0]
-                    post_title = format_post_title(submission.title, len(gallery_items), user_login)
-                    
-                    if first_item[0] == 'photo':
-                        success = tg.send_photo(first_item[1], post_title)
+            
+            for attempt in range(max_retries):
+                try:
+                    success = False
+                    if media_type == 'photo':
+                        success = tg.send_photo(url, "")
+                    elif media_type == 'animation':
+                        success = tg.send_animation(url, "")
+                    elif media_type == 'video':
+                        success = tg.send_video(url, "")
+                        
+                    if success:
+                        break
                     else:
-                        success = tg.send_animation(first_item[1], post_title)
-
-                    if not success:
-                        print(f"Failed to send first item of gallery")
+                        raise Exception("Failed to send media")
+                        
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        print(f"Attempt {attempt + 1} failed: {e}")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print(f"Failed to send media item after {max_retries} attempts")
                         return False
+                
+                # Add small delay between sends to prevent rate limiting
+                time.sleep(1)
 
-                    for item_type, url in gallery_items[1:]:
-                        for attempt in range(max_retries):
-                            try:
-                                if item_type == 'photo':
-                                    success = tg.send_photo(url, "")
-                                else:
-                                    success = tg.send_animation(url, "")
-                                
-                                if success:
-                                    break
-                                else:
-                                    raise Exception("Failed to send media")
-                                
-                            except Exception as e:
-                                if attempt < max_retries - 1:
-                                    print(f"Attempt {attempt + 1} failed: {e}")
-                                    time.sleep(retry_delay)
-                                    retry_delay *= 2
-                                else:
-                                    print(f"Failed to send gallery item after {max_retries} attempts")
-                                    return False
-                            
-                            # Add small delay between sends to prevent rate limiting
-                            time.sleep(1)
-
-                    print(f"Successfully forwarded gallery post with {len(gallery_items)} items")
-                    return True
-
-            elif post_type == "photo":
-                post_url = reddit_post[1]
-                post_title = format_post_title(reddit_post[2], user_login=user_login)
-                return tg.send_photo(post_url, post_title)
-
-            elif post_type == "animation":
-                post_url = reddit_post[1]
-                post_title = format_post_title(reddit_post[2], user_login=user_login)
-                return tg.send_animation(animation_url=post_url, title=post_title)
-
-            elif post_type == "video":
-                video_id = reddit_post[1]
-                video_resolution = reddit_post[2]
-                post_title = format_post_title(reddit_post[3], user_login=user_login)
-                return tg.send_video(video_id=video_id, video_resolution=video_resolution, title=post_title)
-
-            elif post_type == "gfycat":
-                post_url = reddit_post[1]
-                post_title = format_post_title(reddit_post[2], user_login=user_login)
-                return tg.send_gfycat(post_url, post_title)
+        print(f"Successfully forwarded post with {len(media_items)} media items")
+        return True
 
     except Exception as e:
         print(f"Error processing submission: {e}")
