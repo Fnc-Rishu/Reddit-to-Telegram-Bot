@@ -148,6 +148,117 @@ class RedditHandler:
             print(f"Error processing submission: {e}")
             return None
 
+    def collect_media_from_submission(self, submission) -> List[Tuple[str, str]]:
+        """
+        Collect all media items from a submission
+        
+        Returns:
+            List of tuples containing (media_type, media_url)
+        """
+        media_items = []
+        
+        # Handle gallery posts
+        if hasattr(submission, 'gallery_data') and hasattr(submission, 'media_metadata'):
+            for item in submission.gallery_data['items']:
+                media_id = item['media_id']
+                if media_id in submission.media_metadata:
+                    media = submission.media_metadata[media_id]
+                    if media['status'] == 'valid':
+                        if media['e'] == 'Image':
+                            url = media['s']['u'].replace("amp;", "")
+                            media_items.append(("photo", url))
+                        elif media['e'] == 'AnimatedImage':
+                            url = media['s']['gif']
+                            media_items.append(("animation", url))
+                            
+        # Handle single image posts
+        elif self.is_photo_post():
+            url = self.post_json["url_overridden_by_dest"]
+            media_items.append(("photo", url))
+            
+        # Handle video posts
+        elif self.is_video_post():
+            if self.post_json["media"] and 'reddit_video' in self.post_json["media"]:
+                video_url = self.post_json["media"]["reddit_video"]["fallback_url"]
+                media_items.append(("video", video_url))
+                
+        # Handle animation posts
+        elif self.is_animation_post():
+            url = self.post_json["url_overridden_by_dest"]
+            media_items.append(("animation", url))
+            
+        return media_items
+
+    def process_submission(self, submission):
+        """Process a submission and collect all media items"""
+        try:
+            # Skip removed or stickied posts
+            if hasattr(submission, 'removed_by_category') and submission.removed_by_category:
+                return None
+            if submission.stickied:
+                return None
+
+            # Set current subreddit and post ID
+            self.currrent_subreddit = submission.subreddit.display_name
+            self.post_id = submission.id
+
+            # Create post_json from submission
+            self.post_json = {
+                "id": submission.id,
+                "removed_by_category": getattr(submission, 'removed_by_category', None),
+                "stickied": submission.stickied,
+                "permalink": submission.permalink,
+                "title": submission.title,
+                "subreddit": submission.subreddit.display_name,
+                "link_flair_text": submission.link_flair_text,
+                "url_overridden_by_dest": submission.url,
+                "is_gallery": hasattr(submission, 'gallery_data'),
+                "is_video": submission.is_video,
+                "media": submission.media,
+                "post_hint": getattr(submission, 'post_hint', None),
+                "preview": getattr(submission, 'preview', {})
+            }
+
+            if hasattr(submission, 'media_metadata'):
+                self.post_json["media_metadata"] = submission.media_metadata
+
+            # Collect all media items
+            media_items = self.collect_media_from_submission(submission)
+            if not media_items:
+                return None
+
+            # Format post title
+            post_title = self.format_post_title(submission)
+            
+            return {
+                "type": "media_sequence",
+                "media_items": media_items,
+                "title": post_title,
+                "flair": submission.link_flair_text
+            }
+
+        except Exception as e:
+            print(f"Error processing submission: {e}")
+            return None
+
+    def format_post_title(self, submission):
+        """Format the post title with additional information"""
+        post_title = ""
+        
+        if config.getboolean("Telegram", "include_title", fallback=True):
+            post_title += submission.title + "\n"
+            
+        if config.getboolean("Telegram", "link_to_post", fallback=True):
+            current_reddit_url = f'www.reddit.com{submission.permalink}'
+            post_title += f'<a href="{current_reddit_url}">r/{submission.subreddit.display_name}</a>\n'
+            
+        if config.getboolean("Telegram", "sign_messages", fallback=True):
+            channel_link = config["Telegram"]["channel_link"]
+            channel_name = config["Telegram"]["channel_name"]
+            post_title += f'<a href="{channel_link}">-{channel_name}</a>'
+            
+        return post_title
+
     def process_gallery(self, submission):
         """Process gallery submissions"""
         try:
