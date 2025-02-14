@@ -5,47 +5,78 @@ from configparser import ConfigParser
 from telegram_handler import TelegramHandler
 from reddit_handler import RedditHandler
 from cache import Cache
+from datetime import datetime, timezone
 
 # ------Loading Data from the Config File----------
 config = ConfigParser()
 config.read("config.ini")
 
 chat_id = config["Telegram"]["chat_id"]
+
+def create_flair_pattern(flair_text):
+    """Creates a pattern that matches flair text with or without emoji prefix"""
+    escaped = re.escape(flair_text.strip())
+    return re.compile(rf"(?::[a-z]+:\s*)?{escaped}$", re.IGNORECASE)
+
 # Convert desired flairs to regex patterns
-desired_flairs = [re.compile(rf"^{re.escape(flair.strip())}$", re.IGNORECASE) 
+desired_flairs = [create_flair_pattern(flair) 
                  for flair in config["Main"]["desired_flairs"].split(",")]
 
 tg = TelegramHandler(chat_id=chat_id)
 reddit = RedditHandler()
 cache = Cache()
 
+def format_post_title(original_title, media_count=None, user_login=None):
+    """Format the post title with metadata including timestamp and user info"""
+    utc_now = datetime.now(timezone.utc)
+    formatted_time = utc_now.strftime("%Y-%m-%d %H:%M:%S")
+    
+    title_parts = [original_title]
+    
+    if media_count and media_count > 1:
+        title_parts.append(f"\n\n{media_count} images in this post")
+    
+    # Add timestamp and user info
+    title_parts.append(f"\nCurrent Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {formatted_time}")
+    if user_login:
+        title_parts.append(f"Current User's Login: {user_login}")
+    
+    return "\n".join(title_parts)
+
 def matches_desired_flair(post_flair):
-    """
-    Check if the post flair matches any of the desired flairs using regex
-    """
+    """Check if the post flair matches any of the desired flairs using regex"""
     if not post_flair:
         return False
     
-    return any(pattern.match(post_flair.strip()) for pattern in desired_flairs)
+    post_flair = post_flair.strip()
+    flair_text = post_flair.split(":", 2)[-1].strip() if ":" in post_flair else post_flair
+    
+    print(f"Processing flair: '{post_flair}' (cleaned text: '{flair_text}')")
+    
+    for pattern in desired_flairs:
+        if pattern.search(post_flair):
+            desired_flair_texts = [f.strip() for f in config["Main"]["desired_flairs"].split(",")]
+            if any(flair_text.lower() == desired.lower() for desired in desired_flair_texts):
+                print(f"Matched flair '{post_flair}' with pattern '{pattern.pattern}'")
+                return True
+            else:
+                print(f"Flair text '{flair_text}' not in desired flairs list despite pattern match")
+                return False
+    
+    print(f"Post skipped due to flair '{post_flair}' not matching any desired flairs.")
+    return False
 
 def process_submission(submission):
-    """
-    Process a single Reddit submission
-    """
+    """Process a single Reddit submission with support for multiple media"""
     try:
-        # Skip if post is already in cache
         if Cache.is_a_repost(submission.subreddit.display_name, submission.id):
             return None
 
-        # Get post flair
         post_flair = submission.link_flair_text.strip() if submission.link_flair_text else ""
         
-        # Skip if flair doesn't match desired flairs
         if not matches_desired_flair(post_flair):
-            print(f"Post skipped due to flair '{post_flair}' not matching any desired flairs.")
             return None
 
-        # Convert submission to post data
         reddit_post = reddit.process_submission(submission)
         
         if not reddit_post:
@@ -53,67 +84,95 @@ def process_submission(submission):
 
         if isinstance(reddit_post, tuple):
             post_type = reddit_post[0]
-            post_url = reddit_post[1]
-            post_title = reddit_post[2]
-
-            # Save to cache before processing
+            
             Cache.save_post_id(submission.subreddit.display_name, submission.id)
+            
+            max_retries = 3
+            retry_delay = 5
+            user_login = submission.author.name if submission.author else "Unknown"
 
-            # Process different post types
-            if post_type == "photo":
-                photo_status = tg.send_photo(post_url, post_title)
-                if not photo_status:
-                    return None
+            if post_type == "gallery":
+                gallery_items = []
+                
+                if hasattr(submission, 'gallery_data') and hasattr(submission, 'media_metadata'):
+                    for item_id in submission.gallery_data['items']:
+                        metadata = submission.media_metadata[item_id['media_id']]
+                        if metadata['status'] == 'valid':
+                            if metadata['e'] == 'Image':
+                                url = metadata['s']['u']
+                                gallery_items.append(('photo', url))
+                            elif metadata['e'] == 'AnimatedImage':
+                                url = metadata['s']['gif']
+                                gallery_items.append(('animation', url))
 
-            elif post_type == "gallery":
-                gallery_photo_posts = reddit_post[1]
-                gallery_animation_posts = reddit_post[2]
+                if gallery_items:
+                    first_item = gallery_items[0]
+                    post_title = format_post_title(submission.title, len(gallery_items), user_login)
+                    
+                    if first_item[0] == 'photo':
+                        success = tg.send_photo(first_item[1], post_title)
+                    else:
+                        success = tg.send_animation(first_item[1], post_title)
 
-                gallery_photo_post_len = len(gallery_photo_posts)
-                gallery_animation_post_len = len(gallery_animation_posts)
+                    if not success:
+                        print(f"Failed to send first item of gallery")
+                        return False
 
-                gallery_json_obj = json.dumps(gallery_photo_posts)
+                    for item_type, url in gallery_items[1:]:
+                        for attempt in range(max_retries):
+                            try:
+                                if item_type == 'photo':
+                                    success = tg.send_photo(url, "")
+                                else:
+                                    success = tg.send_animation(url, "")
+                                
+                                if success:
+                                    break
+                                else:
+                                    raise Exception("Failed to send media")
+                                
+                            except Exception as e:
+                                if attempt < max_retries - 1:
+                                    print(f"Attempt {attempt + 1} failed: {e}")
+                                    time.sleep(retry_delay)
+                                    retry_delay *= 2
+                                else:
+                                    print(f"Failed to send gallery item after {max_retries} attempts")
+                                    return False
+                            
+                            # Add small delay between sends to prevent rate limiting
+                            time.sleep(1)
 
-                if gallery_photo_post_len == 0:  # If gallery has only GIFs
-                    for animation_url in gallery_animation_posts:
-                        if gallery_animation_posts.index(animation_url) == gallery_animation_post_len - 1:
-                            gallery_status = tg.send_animation(animation_url=animation_url, title=post_title)
-                        else:
-                            gallery_status = tg.send_animation(animation_url=animation_url, title="")
+                    print(f"Successfully forwarded gallery post with {len(gallery_items)} items")
+                    return True
 
-                elif gallery_animation_post_len == 0:
-                    gallery_status = tg.send_media_group(gallery_json_obj)
-
-                else:  # Gallery has both GIFs and photos
-                    for animation_url in gallery_animation_posts:
-                        gallery_status = tg.send_animation(animation_url)
-                    gallery_status = tg.send_media_group(gallery_json_obj)
+            elif post_type == "photo":
+                post_url = reddit_post[1]
+                post_title = format_post_title(reddit_post[2], user_login=user_login)
+                return tg.send_photo(post_url, post_title)
 
             elif post_type == "animation":
-                animation_status = tg.send_animation(animation_url=post_url, title=post_title)
-                if not animation_status:
-                    return None
+                post_url = reddit_post[1]
+                post_title = format_post_title(reddit_post[2], user_login=user_login)
+                return tg.send_animation(animation_url=post_url, title=post_title)
 
             elif post_type == "video":
                 video_id = reddit_post[1]
                 video_resolution = reddit_post[2]
-                video_status = tg.send_video(video_id=video_id, video_resolution=video_resolution, title=post_title)
-                if not video_status:
-                    return None
+                post_title = format_post_title(reddit_post[3], user_login=user_login)
+                return tg.send_video(video_id=video_id, video_resolution=video_resolution, title=post_title)
 
             elif post_type == "gfycat":
-                gfycat_status = tg.send_gfycat(post_url, post_title)
-                if not gfycat_status:
-                    return None
+                post_url = reddit_post[1]
+                post_title = format_post_title(reddit_post[2], user_login=user_login)
+                return tg.send_gfycat(post_url, post_title)
 
     except Exception as e:
         print(f"Error processing submission: {e}")
         return None
 
 def stream_subreddits():
-    """
-    Stream new posts from configured subreddits
-    """
+    """Stream new posts from configured subreddits"""
     subreddits = [s.strip() for s in config["Reddit"]["subreddits"].split(",")]
     multi_subreddit = "+".join(subreddits)
     
@@ -122,7 +181,6 @@ def stream_subreddits():
     
     while True:
         try:
-            # Get the subreddit stream
             for submission in reddit.get_submission_stream():
                 process_submission(submission)
         except Exception as e:
