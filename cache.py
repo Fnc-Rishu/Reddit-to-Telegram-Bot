@@ -65,3 +65,6 @@ class Cache:
             with open(f"cache/{subreddit}.json","w")as datafile:
                 new_data[subreddit].append(post_id)
                 json.dump(new_data, datafile, indent=4)
+
+
+
