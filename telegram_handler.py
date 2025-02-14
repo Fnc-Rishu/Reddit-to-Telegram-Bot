@@ -19,38 +19,53 @@ action_apiURL = f'https://api.telegram.org/bot{apiToken}/sendChatAction'
 # Parameters
 parse_mode = "HTML"
 MAX_RETRIES = 2
+MEDIA_GROUP_LIMIT = 10  # Telegram's limit for media groups
 
 class TelegramHandler:
     def __init__(self, chat_id):
         self.chat_id = chat_id
 
-    def send_photo(self, photo, title):
-        PHOTO_PARAMETER = {
-            "chat_id": self.chat_id,
-            "photo": photo,
-            "caption": title,
-            "disable_notification": ENABLE_NOTIFICATION,
-            "parse_mode": parse_mode
-        }
+    def send_media_sequence(self, media_items, title):
+        """
+        Send multiple media items in sequence, respecting Telegram's rate limits
         
-        for tries in range(MAX_RETRIES):
-            try:
-                action_response = requests.post(action_apiURL, {
-                    "chat_id": self.chat_id, 
-                    "action": "upload_photo"
-                })
-                photo_response = requests.post(photo_apiURL, PHOTO_PARAMETER)
-                photo_response.raise_for_status()
-            except:
-                print("send_photo Failed, retrying once again...")
-                time.sleep(4)
-            else:
-                print("send_photo Successful")
-                return True
-        return False
+        Args:
+            media_items: List of tuples (media_type, media_url)
+            title: Caption for the first media item
+        """
+        if not media_items:
+            return False
+
+        success = True
+        current_group = []
+        
+        for index, (media_type, media_url) in enumerate(media_items):
+            # First item gets the full caption
+            caption = title if index == 0 else ""
+            
+            media_obj = {
+                "type": "photo" if media_type == "photo" else "video",
+                "media": media_url,
+                "caption": caption,
+                "parse_mode": parse_mode
+            }
+            
+            current_group.append(media_obj)
+            
+            # Send when we hit the group limit or it's the last item
+            if len(current_group) == MEDIA_GROUP_LIMIT or index == len(media_items) - 1:
+                if not self.send_media_group(current_group):
+                    success = False
+                current_group = []
+                time.sleep(2)  # Add delay between groups to avoid rate limits
+        
+        return success
 
     def send_media_group(self, media_obj_list):
-        """Send a group of media items with a single caption"""
+        """Send a group of media items as a single media group"""
+        if not media_obj_list:
+            return True
+            
         for tries in range(MAX_RETRIES):
             try:
                 action_response = requests.post(action_apiURL, {
@@ -58,55 +73,22 @@ class TelegramHandler:
                     "action": "upload_photo"
                 })
                 
-                # Make sure only the first media item has a caption
-                if len(media_obj_list) > 1:
-                    first_caption = media_obj_list[0].get('caption', '')
-                    for item in media_obj_list[1:]:
-                        item['caption'] = ''  # Remove caption from all but first item
-                
-                group_media_response = requests.post(
+                response = requests.post(
                     media_group_apiURL,
-                    {
+                    json={
                         "chat_id": self.chat_id,
                         "media": media_obj_list,
                         "disable_notification": ENABLE_NOTIFICATION,
                     }
                 )
-                group_media_response.raise_for_status()
+                response.raise_for_status()
+                print(f"Successfully sent media group with {len(media_obj_list)} items")
                 return True
             except Exception as e:
-                print(f"send_media_group Failed, retrying once again... Error: {e}")
+                print(f"send_media_group Failed, retrying... Error: {e}")
                 time.sleep(4)
         return False
 
-    def send_animation(self, animation_url, title=None):
-        # Convert .gifv to .mp4 if needed
-        animation_url_ext = animation_url.rsplit(".", 1)[1]
-        if animation_url_ext == "gifv":
-            animation_url = animation_url.replace(animation_url_ext, "mp4")
-        
-        for tries in range(MAX_RETRIES):
-            try:
-                action_response = requests.post(action_apiURL, {
-                    "chat_id": self.chat_id,
-                    "action": "upload_document"
-                })
-                animation_response = requests.post(
-                    animation_apiURL,
-                    {
-                        "chat_id": self.chat_id,
-                        "animation": animation_url,
-                        "caption": title,
-                        "disable_notification": ENABLE_NOTIFICATION,
-                        "parse_mode": parse_mode
-                    }
-                )
-                animation_response.raise_for_status()
-                return True
-            except Exception as e:
-                print("send_animation Failed, retrying once again...")
-                time.sleep(4)
-        return False
 
     def send_video(self, video_id, video_resolution, title):
         retries = 0
