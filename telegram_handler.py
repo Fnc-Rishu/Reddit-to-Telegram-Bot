@@ -1,158 +1,194 @@
 import time
 import requests
 from configparser import ConfigParser
+from typing import List, Tuple, Dict, Any
 
 config = ConfigParser()
 config.read("config.ini")
 
-apiToken = config["Telegram"]["bot_api_key"]
-ENABLE_NOTIFICATION = eval(config["Telegram"]["enable_notification"])
-
-get_apiURL = f'https://api.telegram.org/bot{apiToken}/getUpdates'
-text_apiURL = f'https://api.telegram.org/bot{apiToken}/sendMessage'
-photo_apiURL = f'https://api.telegram.org/bot{apiToken}/sendPhoto'
-animation_apiURL = f'https://api.telegram.org/bot{apiToken}/sendAnimation'
-media_group_apiURL = f'https://api.telegram.org/bot{apiToken}/sendMediaGroup'
-video_apiURL = f'https://api.telegram.org/bot{apiToken}/sendVideo'
-action_apiURL = f'https://api.telegram.org/bot{apiToken}/sendChatAction'
-
-# Parameters
-parse_mode = "HTML"
-MAX_RETRIES = 2
-MEDIA_GROUP_LIMIT = 10  # Telegram's limit for media groups
-
 class TelegramHandler:
     def __init__(self, chat_id):
         self.chat_id = chat_id
+        self.api_token = config["Telegram"]["bot_api_key"]
+        self.enable_notification = eval(config["Telegram"]["enable_notification"])
+        
+        # API URLs
+        self.base_url = f'https://api.telegram.org/bot{self.api_token}'
+        self.photo_url = f'{self.base_url}/sendPhoto'
+        self.media_group_url = f'{self.base_url}/sendMediaGroup'
+        self.action_url = f'{self.base_url}/sendChatAction'
+        self.video_url = f'{self.base_url}/sendVideo'
+        self.animation_url = f'{self.base_url}/sendAnimation'
+        
+        # Constants
+        self.MAX_RETRIES = 2
+        self.MEDIA_GROUP_LIMIT = 10
+        self.parse_mode = "HTML"
 
-    def send_media_sequence(self, media_items, title):
+    def _send_chat_action(self, action: str) -> None:
+        """Send chat action to indicate bot is processing"""
+        try:
+            requests.post(self.action_url, {
+                "chat_id": self.chat_id,
+                "action": action
+            })
+        except Exception as e:
+            print(f"Failed to send chat action: {e}")
+
+    def send_photo(self, photo_url: str, caption: str = "") -> bool:
         """
-        Send multiple media items in sequence, respecting Telegram's rate limits
+        Send a single photo message
         
         Args:
-            media_items: List of tuples (media_type, media_url)
-            title: Caption for the first media item
+            photo_url: URL of the photo
+            caption: Optional caption for the photo
+        Returns:
+            bool: Success status
         """
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self._send_chat_action("upload_photo")
+                
+                response = requests.post(
+                    self.photo_url,
+                    params={
+                        "chat_id": self.chat_id,
+                        "photo": photo_url,
+                        "caption": caption,
+                        "parse_mode": self.parse_mode,
+                        "disable_notification": not self.enable_notification
+                    }
+                )
+                response.raise_for_status()
+                return True
+                
+            except Exception as e:
+                print(f"Photo send failed (attempt {attempt + 1}): {e}")
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(4)
+        return False
+
+    def send_media_group(self, media_items: List[Dict[str, Any]]) -> bool:
+        """Send a group of media items as a single message"""
+        if not media_items:
+            return True
+            
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                self._send_chat_action("upload_photo")
+                
+                response = requests.post(
+                    self.media_group_url,
+                    json={
+                        "chat_id": self.chat_id,
+                        "media": media_items,
+                        "disable_notification": not self.enable_notification
+                    }
+                )
+                response.raise_for_status()
+                print(f"Successfully sent media group with {len(media_items)} items")
+                return True
+                
+            except Exception as e:
+                print(f"Media group send failed (attempt {attempt + 1}): {e}")
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(4)
+        return False
+
+    def send_media_sequence(self, media_items: List[Tuple[str, str]], title: str) -> bool:
+        """Send multiple media items as grouped messages"""
         if not media_items:
             return False
 
+        # If there's only one media item, use send_photo
+        if len(media_items) == 1:
+            media_type, media_url = media_items[0]
+            if media_type == "photo":
+                return self.send_photo(media_url, title)
+            elif media_type == "video":
+                return self.send_video(media_url, title)
+
         success = True
         current_group = []
+        total_items = len(media_items)
         
         for index, (media_type, media_url) in enumerate(media_items):
-            # First item gets the full caption
-            caption = title if index == 0 else ""
-            
             media_obj = {
                 "type": "photo" if media_type == "photo" else "video",
                 "media": media_url,
-                "caption": caption,
-                "parse_mode": parse_mode
+                "caption": title if index == 0 else "",
+                "parse_mode": self.parse_mode
             }
             
             current_group.append(media_obj)
             
-            # Send when we hit the group limit or it's the last item
-            if len(current_group) == MEDIA_GROUP_LIMIT or index == len(media_items) - 1:
+            if len(current_group) == self.MEDIA_GROUP_LIMIT or index == total_items - 1:
                 if not self.send_media_group(current_group):
                     success = False
+                    print(f"Failed to send media group {index//self.MEDIA_GROUP_LIMIT + 1}")
+                else:
+                    print(f"Successfully sent media group {index//self.MEDIA_GROUP_LIMIT + 1}")
+                
                 current_group = []
-                time.sleep(2)  # Add delay between groups to avoid rate limits
+                if index < total_items - 1:
+                    time.sleep(2)
         
         return success
 
-    def send_media_group(self, media_obj_list):
-        """Send a group of media items as a single media group"""
-        if not media_obj_list:
-            return True
-            
-        for tries in range(MAX_RETRIES):
+    def send_video(self, video_url: str, title: str, resolution: int = 1080) -> bool:
+        """Send a video message"""
+        for attempt in range(self.MAX_RETRIES):
             try:
-                action_response = requests.post(action_apiURL, {
-                    "chat_id": self.chat_id,
-                    "action": "upload_photo"
-                })
+                self._send_chat_action("upload_video")
+                
+                if resolution > 1080:
+                    resolution = 1080
+                elif 720 < resolution < 1000:
+                    resolution = 720
                 
                 response = requests.post(
-                    media_group_apiURL,
-                    json={
-                        "chat_id": self.chat_id,
-                        "media": media_obj_list,
-                        "disable_notification": ENABLE_NOTIFICATION,
-                    }
-                )
-                response.raise_for_status()
-                print(f"Successfully sent media group with {len(media_obj_list)} items")
-                return True
-            except Exception as e:
-                print(f"send_media_group Failed, retrying... Error: {e}")
-                time.sleep(4)
-        return False
-
-
-    def send_video(self, video_id, video_resolution, title):
-        retries = 0
-        posted = False
-        while not posted:
-            try:
-                if retries >= 4:
-                    break
-                
-                # Cap video resolution
-                if video_resolution > 1080:
-                    video_resolution = 1080
-                elif video_resolution > 720 and video_resolution < 1000:
-                    video_resolution = 720
-
-                video_url = f"https://v.redd.it/{video_id}/DASH_{video_resolution}.mp4"
-                action_response = requests.post(action_apiURL, {
-                    "chat_id": self.chat_id,
-                    "action": "upload_video"
-                })
-
-                video_response = requests.post(
-                    video_apiURL,
-                    allow_redirects=True,
+                    self.video_url,
                     params={
                         "chat_id": self.chat_id,
                         "video": video_url,
                         "caption": title,
                         "supports_streaming": "true",
-                        "disable_notification": ENABLE_NOTIFICATION,
-                        "parse_mode": parse_mode
-                    }
+                        "disable_notification": not self.enable_notification,
+                        "parse_mode": self.parse_mode
+                    },
+                    allow_redirects=True
                 )
-                video_response.raise_for_status()
+                response.raise_for_status()
                 return True
-            except requests.exceptions.HTTPError:
-                video_resolution = (int(video_resolution/1.5))  # Reduce resolution
-                retries += 1
+                
+            except Exception as e:
+                print(f"Video send failed (attempt {attempt + 1}): {e}")
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(4)
+                    resolution = int(resolution / 1.5)
         return False
 
-    def send_gfycat(self, gfycat_id, title):
-        gfycat_url = f"https://thumbs.gfycat.com/{gfycat_id}-mobile.mp4"
-        
-        for tries in range(MAX_RETRIES):
+    def send_animation(self, animation_url: str, title: str) -> bool:
+        """Send an animation/GIF message"""
+        for attempt in range(self.MAX_RETRIES):
             try:
-                action_response = requests.post(action_apiURL, {
-                    "chat_id": self.chat_id,
-                    "action": "upload_video"
-                })
-                gfycat_response = requests.post(
-                    video_apiURL,
-                    allow_redirects=True,
+                self._send_chat_action("upload_video")
+                
+                response = requests.post(
+                    self.animation_url,
                     params={
                         "chat_id": self.chat_id,
-                        "video": gfycat_url,
+                        "animation": animation_url,
                         "caption": title,
-                        "supports_streaming": "true",
-                        "disable_notification": ENABLE_NOTIFICATION,
-                        "parse_mode": parse_mode
+                        "parse_mode": self.parse_mode,
+                        "disable_notification": not self.enable_notification
                     }
                 )
-                gfycat_response.raise_for_status()
+                response.raise_for_status()
                 return True
-            except:
-                print("send_gfycat Failed, retrying once again...")
-                time.sleep(4)
+                
+            except Exception as e:
+                print(f"Animation send failed (attempt {attempt + 1}): {e}")
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(4)
         return False
