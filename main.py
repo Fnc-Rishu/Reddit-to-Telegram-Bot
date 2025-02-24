@@ -11,20 +11,45 @@ from datetime import datetime, timezone
 config = ConfigParser()
 config.read("config.ini")
 
+# Initialize global handlers
 chat_id = config["Telegram"]["chat_id"]
+tg = TelegramHandler(chat_id=chat_id)
+reddit = RedditHandler()  # Added this line
+cache = Cache()
 
 def create_flair_pattern(flair_text):
     """Creates a pattern that matches flair text with or without emoji prefix"""
-    escaped = re.escape(flair_text.strip())
+    # Remove any existing emoji prefix if present
+    cleaned_text = flair_text.split(":", 2)[-1].strip() if ":" in flair_text else flair_text.strip()
+    # Escape special characters but preserve spaces
+    escaped = " ".join(re.escape(part) for part in cleaned_text.split())
     return re.compile(rf"(?::[a-z]+:\s*)?{escaped}$", re.IGNORECASE)
 
 # Convert desired flairs to regex patterns
-desired_flairs = [create_flair_pattern(flair) 
+desired_flairs = [create_flair_pattern(flair.strip()) 
                  for flair in config["Main"]["desired_flairs"].split(",")]
 
-tg = TelegramHandler(chat_id=chat_id)
-reddit = RedditHandler()
-cache = Cache()
+def matches_desired_flair(post_flair):
+    """Check if the post flair matches any of the desired flairs"""
+    if not post_flair:
+        return False
+    
+    # Clean the post flair text
+    cleaned_flair = post_flair.split(":", 2)[-1].strip() if ":" in post_flair else post_flair.strip()
+    print(f"Processing flair: '{post_flair}' (cleaned text: '{cleaned_flair}')")
+    
+    # Check against each pattern
+    for pattern in desired_flairs:
+        if pattern.search(post_flair):
+            print(f"Matched flair '{post_flair}' with pattern '{pattern.pattern}'")
+            # Verify the cleaned text matches exactly (case-insensitive)
+            desired_flair_texts = [f.strip().split(":", 2)[-1].strip() 
+                                 for f in config["Main"]["desired_flairs"].split(",")]
+            if any(cleaned_flair.lower() == desired.lower() for desired in desired_flair_texts):
+                return True
+    
+    print(f"Post skipped due to flair '{post_flair}' not matching any desired flairs.")
+    return False
 
 def format_post_title(original_title, media_count=None, user_login=None):
     """Format the post title with metadata including timestamp and user info"""
@@ -43,54 +68,34 @@ def format_post_title(original_title, media_count=None, user_login=None):
     
     return "\n".join(title_parts)
 
-def matches_desired_flair(post_flair):
-    """Check if the post flair matches any of the desired flairs using regex"""
-    if not post_flair:
-        return False
-    
-    post_flair = post_flair.strip()
-    flair_text = post_flair.split(":", 2)[-1].strip() if ":" in post_flair else post_flair
-    
-    print(f"Processing flair: '{post_flair}' (cleaned text: '{flair_text}')")
-    
-    for pattern in desired_flairs:
-        if pattern.search(post_flair):
-            desired_flair_texts = [f.strip() for f in config["Main"]["desired_flairs"].split(",")]
-            if any(flair_text.lower() == desired.lower() for desired in desired_flair_texts):
-                print(f"Matched flair '{post_flair}' with pattern '{pattern.pattern}'")
-                return True
-            else:
-                print(f"Flair text '{flair_text}' not in desired flairs list despite pattern match")
-                return False
-    
-    print(f"Post skipped due to flair '{post_flair}' not matching any desired flairs.")
-    return False
-
 def collect_media_items(submission):
     """Collect all media items from a submission"""
     media_items = []
     
-    if hasattr(submission, 'gallery_data') and hasattr(submission, 'media_metadata'):
-        for item in submission.gallery_data['items']:
-            media_id = item['media_id']
-            if media_id in submission.media_metadata:
-                metadata = submission.media_metadata[media_id]
-                if metadata['status'] == 'valid':
-                    if metadata['e'] == 'Image':
-                        url = metadata['s']['u'].replace("amp;", "")
-                        media_items.append(('photo', url))
-                    elif metadata['e'] == 'AnimatedImage':
-                        url = metadata['s']['gif'].replace("amp;", "")
-                        media_items.append(('animation', url))
-    elif submission.url.lower().split('.')[-1] in ['jpg', 'jpeg', 'png', 'webp']:
-        media_items.append(('photo', submission.url))
-    elif submission.url.lower().split('.')[-1] in ['gif', 'gifv', 'mp4']:
-        media_items.append(('animation', submission.url))
-    elif hasattr(submission, 'is_video') and submission.is_video:
-        if submission.media and 'reddit_video' in submission.media:
-            url = submission.media['reddit_video']['fallback_url']
-            media_items.append(('video', url))
-            
+    try:
+        if hasattr(submission, 'gallery_data') and hasattr(submission, 'media_metadata'):
+            for item in submission.gallery_data['items']:
+                media_id = item['media_id']
+                if media_id in submission.media_metadata:
+                    metadata = submission.media_metadata[media_id]
+                    if metadata['status'] == 'valid':
+                        if metadata['e'] == 'Image':
+                            url = metadata['s']['u'].replace("amp;", "")
+                            media_items.append(('photo', url))
+                        elif metadata['e'] == 'AnimatedImage':
+                            url = metadata['s']['gif'].replace("amp;", "")
+                            media_items.append(('animation', url))
+        elif submission.url.lower().split('.')[-1] in ['jpg', 'jpeg', 'png', 'webp']:
+            media_items.append(('photo', submission.url))
+        elif submission.url.lower().split('.')[-1] in ['gif', 'gifv', 'mp4']:
+            media_items.append(('animation', submission.url))
+        elif hasattr(submission, 'is_video') and submission.is_video:
+            if submission.media and 'reddit_video' in submission.media:
+                url = submission.media['reddit_video']['fallback_url']
+                media_items.append(('video', url))
+    except Exception as e:
+        print(f"Error collecting media items: {e}")
+    
     return media_items
 
 def process_submission(submission):
@@ -111,29 +116,47 @@ def process_submission(submission):
 
         Cache.save_post_id(submission.subreddit.display_name, submission.id)
         
-        user_login = submission.author.name if submission.author else "Unknown"
-        post_title = format_post_title(submission.title, len(media_items), user_login)
-
-        # Format base title with metadata
-        base_title = post_title
+        # Just use the plain title without any additional formatting
+        caption = submission.title
+        
+        # Only add subreddit link and channel signature if configured
         if config.getboolean("Telegram", "link_to_post", fallback=True):
-            base_title += f'\n<a href="https://www.reddit.com{submission.permalink}">r/{submission.subreddit.display_name}</a>'
+            caption += f'\n<a href="https://www.reddit.com{submission.permalink}">r/{submission.subreddit.display_name}</a>'
         if config.getboolean("Telegram", "sign_messages", fallback=True):
-            base_title += f'\n<a href="{config["Telegram"]["channel_link"]}">-{config["Telegram"]["channel_name"]}</a>'
+            caption += f'\n<a href="{config["Telegram"]["channel_link"]}">-{config["Telegram"]["channel_name"]}</a>'
 
-        # Send first item with full caption
+        # Send all media items
+        success = send_media_items(media_items, caption)
+        
+        if success:
+            print(f"Successfully forwarded post with {len(media_items)} media items")
+            return True
+        else:
+            print("Failed to forward post")
+            return False
+
+    except Exception as e:
+        print(f"Error processing submission: {e}")
+        return None
+
+def send_media_items(media_items, caption):
+    """Send all media items with proper error handling"""
+    try:
+        # Send first item with just the title as caption
         first_item = media_items[0]
+        success = False
+        
         if first_item[0] == 'photo':
-            if not tg.send_photo(first_item[1], base_title):
-                return False
+            success = tg.send_photo(first_item[1], caption)
         elif first_item[0] == 'animation':
-            if not tg.send_animation(first_item[1], base_title):
-                return False
+            success = tg.send_animation(first_item[1], caption)
         elif first_item[0] == 'video':
-            if not tg.send_video(first_item[1], base_title):
-                return False
+            success = tg.send_video(first_item[1], caption)
+            
+        if not success:
+            return False
 
-        # Send remaining items without caption
+        # Send remaining items without any caption
         for media_type, url in media_items[1:]:
             max_retries = 3
             retry_delay = 5
@@ -150,8 +173,6 @@ def process_submission(submission):
                         
                     if success:
                         break
-                    else:
-                        raise Exception("Failed to send media")
                         
                 except Exception as e:
                     if attempt < max_retries - 1:
@@ -162,11 +183,13 @@ def process_submission(submission):
                         print(f"Failed to send media item after {max_retries} attempts")
                         return False
                 
-                # Add small delay between sends to prevent rate limiting
-                time.sleep(1)
-
-        print(f"Successfully forwarded post with {len(media_items)} media items")
+                time.sleep(1)  # Rate limiting delay
+                
         return True
+        
+    except Exception as e:
+        print(f"Error sending media items: {e}")
+        return False
 
     except Exception as e:
         print(f"Error processing submission: {e}")
